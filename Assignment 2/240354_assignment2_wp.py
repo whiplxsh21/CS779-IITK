@@ -1,6 +1,73 @@
 import argparse
 import os
 from collections import defaultdict
+import re
+import heapq
+import math
+
+RESERVED_TOKENS = ['<pad>', '<unk>', '<s>', '</s>']
+
+# defining the custom data structures used
+class Node:
+    """double linked list node (represents a token in a word)"""
+    def __init__(self, token_index):
+        self.token_index = token_index
+        self.prev = None
+        self.next = None
+        
+class SplitWord:
+    """double linked list representing word's current split"""
+    def __init__(self, tokens):
+        self.head = None
+        self.tail = None
+        self.nodes = []
+        prev = None
+        for token in tokens:
+            node = Node(token)
+            node.prev = prev
+            if prev:
+                prev.next = node
+            else:
+                self.head = node
+            prev = node
+            self.nodes.append(node)
+        self.tail = prev
+    
+    def tokens_list(self):
+        """returns list of tokens"""
+        toktokitoki = []
+        node = self.head
+        while node:
+            toktokitoki.append(node.token_index)
+            node = node.next
+        return toktokitoki
+    
+    def merge_tokens(self, left, new_token_index):
+        """merge left node with its next node, creating a new token"""
+        right = left.next
+        if not right:
+            return None
+        
+        # create new merged node
+        new_node = Node(new_token_index)
+        new_node.prev = left.prev
+        new_node.next = right.next
+        
+        if left.prev:
+            left.prev.next = new_node
+        else:
+            self.head = new_node
+        
+        if right.next:
+            right.next.prev = new_node
+        else:
+            self.tail = new_node
+        
+        # remove old nodes
+        left.next = None; left.prev = None
+        right.prev = None; right.next = None
+
+        return new_node
 
 def load_training_data(train_path):
     """loads training data and returns dict of word frequencies"""
@@ -10,82 +77,116 @@ def load_training_data(train_path):
             for word in line.strip().split():
                 word_frequencies[word] += 1
     return word_frequencies
+    
+def train_wp_tokenizer(word_frequencies, vocab_size):
+    characters = set()
+    for word in word_frequencies:
+        characters.update(word)
+    initial_vocab = sorted(characters)
+    vocab = RESERVED_TOKENS + initial_vocab
+    vocab = list(dict.fromkeys(vocab))  
+    #print(f"initi vocab size: {len(vocab)}")  
+    word_splits = {}
+    for word in word_frequencies:
+        word_splits[word] = SplitWord(list(word))
 
-    
-def train_wordpiece_tokenizer(word_frequencies, vocab_size):
-    """Learn WordPiece vocab with reserved tokens first."""
-    
-    # initialise vocab 
-    vocab = set()
-    for word in word_frequencies.keys():
-        vocab.update(list(word))
-    
-    # sort for deterministic
-    vocab = sorted(list(vocab))
-    RESERVED_TOKENS = ['<pad>', '<unk>', '<s>', '</s>']
-    vocab = RESERVED_TOKENS + vocab
-    
-    splits = {word: [char for char in word] for word in word_frequencies.keys()}
-    
-    while len(vocab) < vocab_size:
-        
-        # pair frequencies
-        pair_frequencies = defaultdict(int)
-        for word, frequency in word_frequencies.items():
-            word_split = splits[word]
-            for i in range(len(word_split)-1):
-                pair = (word_split[i], word_split[i+1])
-                pair_frequencies[pair] += frequency
-        
-        if not pair_frequencies:
-            break
-        
-        # individual tokens frequencies
-        token_frequenies = defaultdict(int)
-        for word, frequency in word_frequencies.items():
-            for token in splits[word]:
-                token_frequenies[token] += frequency
-                
-        # find the merge_pair
-        merge_pair = None
-        max_score = -21
-        for pair, frequency in pair_frequencies.items():
-            # ensure tokens exist first
-            if token_frequenies.get(pair[0], 0) == 0 or token_frequenies.get(pair[1], 0) == 0:
-                continue
-            
-            # score = freq(a,b) / freq(a) * freq(b)
-            score = frequency / (token_frequenies[pair[0]]) * (token_frequenies[pair[1]])
-            if score > max_score or (score == max_score and pair < (merge_pair if merge_pair else ())):
-                max_score = score
-                merge_pair = pair
-            
-        if merge_pair is None:
-            break
-        
-        # merge the merge pair
-        new_token = str(merge_pair[0]) + str(merge_pair[1])
+    pair_frequencies = defaultdict(int)
+    pair_positions = defaultdict(set)
+
+    for word, word_split in word_splits.items():
+        node = word_split.head
+        while node and node.next:
+            pair = (node.token_index, node.next.token_index)
+            pair_frequencies[pair] += word_frequencies[word]
+            pair_positions[pair].add((word, node))
+            node = node.next
+
+    tokenwise_frequencies = defaultdict(int)
+    for word, frequency in word_frequencies.items():
+        for token in list(word):
+            tokenwise_frequencies[token] += frequency
+
+    def get_score(pair):
+        freq_ab = pair_frequencies.get(pair, 0)
+        if freq_ab == 0:
+            return -math.inf
+        freq_a = tokenwise_frequencies.get(pair[0], 0)
+        freq_b = tokenwise_frequencies.get(pair[1], 0)
+        if freq_a == 0 or freq_b == 0:
+            return -math.inf
+        return math.log(freq_ab) - math.log(freq_a) - math.log(freq_b)
+
+    heap = []
+    merge_count = 0
+    for pair in list(pair_frequencies.keys()):
+        score = get_score(pair)
+        if score > -math.inf:
+            heapq.heappush(heap, (-score, merge_count, pair))
+            merge_count += 1
+
+    while len(vocab) < vocab_size and heap:
+        neg_score, _, pair = heapq.heappop(heap)
+        if pair_frequencies.get(pair, 0) == 0:
+            continue
+
+        new_token = pair[0] + pair[1]
+        if new_token in vocab:
+            continue
         vocab.append(new_token)
-        
-        # update splits with new token created
-        new_splits = {}
-        for word, split in splits.items():
-            new_word_split = []
-            i = 0
-            while i < len(split):
-                if i < len(split) - 1 and (split[i], split[i+1]) == merge_pair:
-                    new_word_split.append(new_token)
-                    i += 2
-                else:
-                    new_word_split.append(split[i])
-                    i += 1
-            new_splits[word] = new_word_split
-        splits = new_splits
 
-    # here tokenizer object is just the new vocab after merge
+        tokenwise_frequencies[new_token] = pair_frequencies[pair]
+
+        pair_instances = list(pair_positions[pair])
+        pair_positions[pair].clear()
+        pair_frequencies[pair] = 0
+
+        changed_pairs = set()
+        for word, left_node in pair_instances:
+            splt = word_splits[word]
+            if not left_node.next or (left_node.token_index, left_node.next.token_index) != pair:
+                continue
+            prev_node = left_node.prev
+            next_node = left_node.next.next
+
+            if prev_node:
+                old_pair = (prev_node.token_index, pair[0])
+                if old_pair in pair_frequencies:
+                    pair_frequencies[old_pair] -= word_frequencies[word]
+                    pair_positions[old_pair].discard((word, prev_node))
+                    changed_pairs.add(old_pair)
+
+            if next_node:
+                old_pair = (pair[1], next_node.token_index)
+                if old_pair in pair_frequencies:
+                    pair_frequencies[old_pair] -= word_frequencies[word]
+                    pair_positions[old_pair].discard((word, left_node.next))
+                    changed_pairs.add(old_pair)
+
+            new_node = splt.merge_tokens(left_node, new_token)
+
+            if new_node.prev:
+                new_pair = (new_node.prev.token_index, new_token)
+                pair_frequencies[new_pair] += word_frequencies[word]
+                pair_positions[new_pair].add((word, new_node.prev))
+                changed_pairs.add(new_pair)
+
+            if new_node.next:
+                new_pair = (new_token, new_node.next.token_index)
+                pair_frequencies[new_pair] += word_frequencies[word]
+                pair_positions[new_pair].add((word, new_node))
+                changed_pairs.add(new_pair)
+
+        for changed in changed_pairs:
+            if pair_frequencies.get(changed, 0) > 0:
+                score = get_score(changed)
+                if score > -math.inf:
+                    heapq.heappush(heap, (-score, merge_count, changed))
+                    merge_count += 1
+
+    #print(f"final vocav size: {len(vocab)}")
     tokenizer = {'vocab': set(vocab)}
-    return vocab, tokenizer
-        
+    return set(vocab), tokenizer
+
         
 def save_vocab(vocab, rollno, vocab_size):
     fname = f"{rollno}_assignment2_wp_vocab_{vocab_size}.txt"
@@ -106,6 +207,7 @@ def tokenize_wp(text, tokenizer):
         sub_word = word
         while sub_word:
             # find longest subword prefix in the vocav
+            best_sub = ""
             for i in range(len(sub_word), 0, -1):
                 if sub_word[:i] in vocab_set:
                     best_sub = sub_word[:i]
@@ -166,7 +268,7 @@ if __name__ == "__main__":
     rollno = "240354"
 
     train_text = load_training_data(args.train)
-    vocab, tokenizer = train_wordpiece_tokenizer(train_text, args.vocab_size)
+    vocab, tokenizer = train_wp_tokenizer(train_text, args.vocab_size)
     save_vocab(vocab, rollno, args.vocab_size)
 
     with open(args.input, "r", encoding="utf-8") as f:
@@ -176,3 +278,6 @@ if __name__ == "__main__":
 
     detok_text = detokenize_wp(tokens, tokenizer)
     save_detokenized(detok_text, rollno)
+
+
+
